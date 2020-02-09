@@ -3,6 +3,7 @@
 #include "SdUsbConnect.h"
 #include "JPEG_Converter.h"
 #include "dcache-control.h"
+#include "AsciiFont.h"
 
 #define MOUNT_NAME             "storage"
 
@@ -14,17 +15,12 @@
 #define FRAME_BUFFER_STRIDE    (((VIDEO_PIXEL_HW * 2) + 31u) & ~31u)
 #define FRAME_BUFFER_HEIGHT    (VIDEO_PIXEL_VW)
 
-#if defined(__ICCARM__)
-#pragma data_alignment=32
-static uint8_t user_frame_buffer0[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]@ ".mirrorram";
-#else
-static uint8_t user_frame_buffer0[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((section("NC_BSS"),aligned(32)));
-#endif
-static int file_name_index = 1;
+static uint8_t user_frame_buffer0[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(128)));
+static uint8_t user_frame_buffer1[FRAME_BUFFER_STRIDE * FRAME_BUFFER_HEIGHT]__attribute((aligned(128)));
 static volatile int Vfield_Int_Cnt = 0;
 
 /* jpeg convert */
-#define JPEG_ENCODE_QUALITY    (75)  /* JPEG encode quality (min:1, max:75 (Considering the size of JpegBuffer, about 75 is the upper limit.)) */
+#define JPEG_ENCODE_QUALITY    (50)  /* JPEG encode quality (min:1, max:75 (Considering the size of JpegBuffer, about 75 is the upper limit.)) */
 
 static JPEG_Converter Jcu;
 #if defined(__ICCARM__)
@@ -35,13 +31,21 @@ static uint8_t JpegBuffer[1024 * 63]__attribute((aligned(32)));
 #endif
 
 DisplayBase Display;
-DigitalIn   button0(USER_BUTTON0);
+InterruptIn button0(USER_BUTTON0);
 DigitalOut  led1(LED1);
 
 static void IntCallbackFunc_Vfield(DisplayBase::int_type_t int_type) {
     if (Vfield_Int_Cnt > 0) {
         Vfield_Int_Cnt--;
     }
+ 
+    // overlay something
+    memcpy(user_frame_buffer1, user_frame_buffer0, sizeof(user_frame_buffer0));
+    for (uint32_t i = 0; i < sizeof(user_frame_buffer1); i += 4) {
+        user_frame_buffer1[i + 0] = 0x10;
+        user_frame_buffer1[i + 1] = 0x80;
+    }
+    dcache_clean(user_frame_buffer1, sizeof(user_frame_buffer1));
 }
 
 static void wait_new_image(void) {
@@ -98,6 +102,7 @@ static void Start_LCD_Display(void) {
 }
 #endif
 
+#define MAX_FILE_NUMBER   100       // files
 #define MAX_VIDEO_LENGTH  10 * 1000 // ms
 #define MAX_FRAME_NUM     10 * 60   // frames
 #define VIDEO_BUFF_SIZE  (VIDEO_PIXEL_HW * VIDEO_PIXEL_VW * 2)
@@ -174,12 +179,23 @@ static void set_data(uint8_t * buf, uint32_t data) {
     }
 }
 
-int main() {
+static bool break_flag = false;
+static void break_callback() {
+    break_flag = true;
+}
+
+static void setup() {
     EasyAttach_Init(Display);
     Start_Video_Camera();
 #if MBED_CONF_APP_LCD
     Start_LCD_Display();
 #endif
+    button0.rise(&break_callback);
+}
+
+int main() {
+    setup();
+
     SdUsbConnect storage(MOUNT_NAME);
     FILE * fp;
     char file_name[32];
@@ -188,19 +204,29 @@ int main() {
     uint32_t fps;
     Timer t;
 
-    bool isStop = false;
+    int file_name_index = 1;
 
     Jcu.SetQuality(JPEG_ENCODE_QUALITY);
+    JPEG_Converter::bitmap_buff_info_t bitmap_buff_info;
+    JPEG_Converter::encode_options_t   encode_options;
+    bitmap_buff_info.width              = VIDEO_PIXEL_HW;
+    bitmap_buff_info.height             = VIDEO_PIXEL_VW;
+    bitmap_buff_info.format             = JPEG_Converter::WR_RD_YCbCr422;
+    bitmap_buff_info.buffer_address     = (void *)user_frame_buffer1;
+    encode_options.encode_buff_size     = sizeof(JpegBuffer);
+    encode_options.p_EncodeCallBackFunc = NULL;
+    encode_options.input_swapsetting    = JPEG_Converter::WR_RD_WRSWA_32_16_8BIT;
+
+    storage.wait_connect();
 
     while (1) {
-        storage.wait_connect();
-
-        if (button0 == 0) {
-            isStop = true;
-        }
 
         if (led1 == 0) {
             led1 = 1;
+
+            if (file_name_index > MAX_FILE_NUMBER) {
+                file_name_index = 1;
+            }
             sprintf(file_name, "/" MOUNT_NAME "/movie_%d.avi", file_name_index++);
             fp = fopen(file_name, "w");
             if (fp != NULL) {
@@ -212,24 +238,13 @@ int main() {
                 t.start();
             } else {
                 led1 = 0;
+                break;
             }
-        }
-        if (led1 == 1) {
-            if (mjpg_frame < MAX_FRAME_NUM && !isStop && t.read_ms() < MAX_VIDEO_LENGTH) {
+        } else {
+            if (mjpg_frame < MAX_FRAME_NUM && !break_flag && t.read_ms() < MAX_VIDEO_LENGTH) {
                 size_t jcu_encode_size = 0;
-                JPEG_Converter::bitmap_buff_info_t bitmap_buff_info;
-                JPEG_Converter::encode_options_t   encode_options;
 
                 wait_new_image(); // wait for image input
-
-                bitmap_buff_info.width              = VIDEO_PIXEL_HW;
-                bitmap_buff_info.height             = VIDEO_PIXEL_VW;
-                bitmap_buff_info.format             = JPEG_Converter::WR_RD_YCbCr422;
-                bitmap_buff_info.buffer_address     = (void *)user_frame_buffer0;
-
-                encode_options.encode_buff_size     = sizeof(JpegBuffer);
-                encode_options.p_EncodeCallBackFunc = NULL;
-                encode_options.input_swapsetting    = JPEG_Converter::WR_RD_WRSWA_32_16_8BIT;
 
                 dcache_invalid(JpegBuffer, sizeof(JpegBuffer));
                 if (Jcu.encode(&bitmap_buff_info, JpegBuffer, &jcu_encode_size, &encode_options) == JPEG_Converter::JPEG_CONV_OK) {
@@ -278,13 +293,15 @@ int main() {
                 }
 
                 fclose(fp);
-                printf("Saved file %s , %dfps\r\n", file_name, fps);
+                printf("Saved file %s , %lufps\r\n", file_name, fps);
                 led1 = 0;
 
-                if (isStop) {
+                if (break_flag) {
                     break;
                 }
             }
         }
     }
+
+    printf("end\r\n");
 }
